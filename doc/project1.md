@@ -1,4 +1,7 @@
-[TOC]
+- [Project1](#project1)
+	- [Badger](#badger)
+	- [Project1A](#project1a)
+	- [Project1B](#project1b)
 
 # Project1
 

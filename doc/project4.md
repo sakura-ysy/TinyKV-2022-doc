@@ -1,4 +1,23 @@
-[TOC]
+- [Project4](#project4)
+  - [2PC](#2pc)
+    - [数据写入](#数据写入)
+      - [Prewrite](#prewrite)
+      - [Commit](#commit)
+    - [数据读取](#数据读取)
+    - [Rollback](#rollback)
+  - [Project4A](#project4a)
+    - [GetValue](#getvalue)
+    - [CurrentWrite](#currentwrite)
+    - [MostRecentWrite](#mostrecentwrite)
+  - [Project4B](#project4b)
+    - [KvGet](#kvget)
+    - [KvPrewrite](#kvprewrite)
+    - [KvCommit](#kvcommit)
+  - [Project4C](#project4c)
+    - [KvScan](#kvscan)
+    - [KvCheckTxnStatus](#kvchecktxnstatus)
+    - [KvBatchRollback](#kvbatchrollback)
+    - [KvResolveLock](#kvresolvelock)
 
 # Project4
 
@@ -74,19 +93,19 @@ project4A 实现一些基本操作，比如获取 value、给 lock、给 write �
 
 **Lock**
 
-![图片2](project4/图片2.png)
+<img src="project4/图片2.png" alt="图片2" style="zoom:50%;" />
 
 Lock 的 Key 仅仅由 Cf_Lock 和源 Key 拼接而成，不含 Ts 信息。Lock 的 Ts 信息同 Ttl、Kind、Primary Key 一并存在 Value 中。
 
 **Write**
 
-![图片5](project4/图片5.png)
+<img src="project4/图片5.png" alt="图片5" style="zoom:50%;" />
 
 不同于 Lock，Write 的 Key 中是整合了 commitTs 的，首先通过 EncodeKey 将源 Key 和 commitTs 编码在一起，然后和 Cf_Write 拼接形成新的 Key。Write 的 StartTs 同 Kind 一并存在 Value 中。
 
 **Default**
 
-![图片7](project4/图片7.png)
+<img src="project4/图片7.png" alt="图片7" style="zoom:50%;" />
 
 不同于 Write，Default 的 Key 中整合的是 startTs，而不是 commitTs，用于 Write 进行索引，写入的值存在 Value 中即可。 
 
@@ -157,7 +176,7 @@ project4C 要在 project4B 的基础上，实现扫面、事务状态检查、�
 
 该方法要基于 project1 中的 iter 生成一个新的迭代器，不同于 project1，在 project4 中 key 是整和了 ts 的，所以这里的迭代器要把这个 ts 抽出来，只返回原有的 key 和对应的 value，如下：
 
-<img src="project4/图片1 (1)-166097969088711.png" alt="图片1 (1)" style="zoom:48%;" />
+<img src="project4/图片1 (1)-166097969088711.png" alt="图片1 (1)" style="width:50%;" />
 
 ### KvCheckTxnStatus
 

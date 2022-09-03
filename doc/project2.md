@@ -1,4 +1,31 @@
-[TOC]
+- [Project2](#project2)
+	- [Raft 算法](#raft-算法)
+	- [Project2A](#project2a)
+		- [RaftLog](#raftlog)
+		- [Raft](#raft)
+			- [Msg 收发与处理](#msg-收发与处理)
+				- [MsgHup](#msghup)
+				- [MsgBeat](#msgbeat)
+				- [MsgPropose](#msgpropose)
+				- [MsgAppend](#msgappend)
+				- [MsgAppendResponse](#msgappendresponse)
+				- [MsgRequestVote](#msgrequestvote)
+				- [MsgRequestVoteResponse](#msgrequestvoteresponse)
+			- [推进器 Step()](#推进器-step)
+			- [计时器 tick()](#计时器-tick)
+		- [RawNode](#rawnode)
+		- [2A 疑难杂症](#2a-疑难杂症)
+	- [Project2B](#project2b)
+		- [peer_msg_handler](#peer_msg_handler)
+			- [proposeRaftCommand](#proposeraftcommand)
+			- [HandleRaftReady](#handleraftready)
+		- [PeerStorage](#peerstorage)
+			- [SaveReadyState](#savereadystate)
+			- [Append](#append)
+		- [2B 疑难杂症](#2b-疑难杂症)
+	- [Project2C](#project2c)
+		- [快照流程](#快照流程)
+		- [3C 疑难杂症](#3c-疑难杂症)
 
 # Project2
 
@@ -61,7 +88,7 @@ Raft 通过基础的两个 RPC 来维持节点之间的通信，分别为日志�
 
 总结一下，RawNode 是 raft 层中暴露在外面的模块，用于该层与上层的信息交互，Raft 模块是 raft 层中的核心模块，算法的核心逻辑均在该模块实现，RaftLog 用来暂存日志信息，并维护相关指针。三者的关系用图表示如下：
 
-![图片1](project2/图片1.png)
+<img src="project2/图片1.png" alt="图片1" style="width:60%;" />
 
 其中，Msg 不单指上层传来的请求，也有可能是其他节点发来的 Msg，比如两个 RPC，但这些 Msg 都是通过上层发送与接收的，然后 RawNode 将其传给 Raft 去处理。
 
@@ -412,7 +439,7 @@ Step() 作为驱动器，用来接收上层发来的 Msg，然后根据不同的
 
 实现框架非常直观，如下图所示：
 
-![图片2](project2/图片2.png)
+<img src="project2/图片2.png" alt="图片2" style="width:60%;" />
 
 接着，调用上一模块（Msg 的收发与处理）即可。
 
@@ -565,7 +592,7 @@ store、peer、region 三者的关系如下：
 
 这里将 Rawnode-Raft-RaftLog 统称为 raft 层，把要实现的部分称为 peer 层。peer 层首先接收来自 client 的 RaftCmdRequest，其中包含着不同的`命令请求`，接着它会把这些请求逐一以 entry 的形式传递给 raft 层，当然，这个 peer 应该是 Leader，不然 client 会找下一个 peer 继续试。raft 层收到条目后，会在集群内部进行同步，这就是 project2a 的内容。同步的过程中，peer 层会不时询问 raft 层有哪些已经同步好的 entry 可以拿来应用（执行）？哪些 entry 需要持久化？有没有快照需要应用？等等。三层的交互如下图所示：
 
-![image-20220819214918186](project2/image-20220819214918186.png)
+<img src="project2/image-20220819214918186.png" alt="image-20220819214918186" style="width:67%;" />
 
 该模块要完善两个文件，分别为 `peer_msg_handler.go` 和 `peer_storage.go` 
 
@@ -640,7 +667,7 @@ kvDB 存储：
 
 - 在完成 Snap 条目的 apply 之后，需要给 p.cb.Txn 赋值一个可读事务。因为在 cluster.go 的 Scan() 方法中，会传给 Raft 一个 SnapCmd，然后通过回应的 txn 来构造迭代器。如果在执行完 SnapCmd 后没有给 p.cb.Txn 赋值，那么就会报 nil pointer 错误，如下：
 
-![2](project2/2.png)
+<img src="project2/2.png" alt="2" style="zoom:67%;" />
 
 - 给 txn 赋值一个只读事务就行了。
 
