@@ -7,7 +7,7 @@
 
 Project1 没有设计到分布式，其要求我们实现 `单机` 的存储引擎，并保证其支持 CF。不同于 TiKV 使用的 RocksDB，TinyKV 采用的底层存储为 BadgerDB，虽然同样是基于 LSM 的，但后者不支持 CF，故这里需要自己实现。所谓 CF，就是把同类型的值归结在一起，这在多列存储（比如 MYSQL）中很显然，一列就是一个 CF。但是 KV 是单列存储的，因为为了实现 CF，必须通过单列来模拟多列，方法很简单，就是在 Key 前面拼上 CF 前缀。如下图：
 
-![图片1](project1/图片1-16600521359242.png)
+<img src="project1/图片1-16600521359242.png" alt="图片1" style="width:70%;" />
 
 也就是说，只需要给每一个 Key 加上对应的前缀，就能模拟出多列的效果，从而实现 CF。在 TinyKV 中，一共只有三个 CF，分别为 Default、Lock、Write，三个 CF 用于实现 Project4 的 2PC，这里暂时不用理解。前缀拼接无需自己实现，直接调用项目给的 `KeyWithCF` 即可，其余和 CF 有关的方法也都在 engine_util 中已经提供好了。
 
