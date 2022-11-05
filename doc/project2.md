@@ -653,6 +653,50 @@ kvDB 存储：
 
 至此，Project2B 实现完成。
 
+但这里要明确一下，stable 和 applied 的关系，也就是持久化和应用的关系。实际上，二者是没有关系的！起初，我以为只有当 entry 被 apply 之后，它才会落盘持久化，但后来发现并不是这样。为了说清，这里直接放三段代码：
+
+首先是 raftLog 的 appendEntry，很简单，就是把新来的 entry 加到切片中，是内存中的操作：
+
+``` go
+func (r *Raft) appendEntry(es []*pb.Entry){
+	lastIndex := r.RaftLog.LastIndex()
+	for i := range es {
+		es[i].Term = r.Term
+		es[i].Index = lastIndex + 1 + uint64(i)
+		r.RaftLog.entries = append(r.RaftLog.entries,*es[i])
+	}
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
+	return
+}
+```
+
+接着是 newReady，看看它是怎么取出要持久化的日志的（Entries 字段）：
+
+```go
+func (rn *RawNode)newReady() Ready {
+    // ...
+	rd := Ready{
+		Entries:          r.RaftLog.unstableEntries(),
+		CommittedEntries: r.RaftLog.nextEnts(),
+		Messages:         r.msgs,
+	}
+    // ...
+}
+```
+
+进入 unstableEntries 看一看：
+
+``` go
+func (l *RaftLog) unstableEntries() []pb.Entry {
+    // ...
+	return l.entries[l.stabled-firstIndex+1:]
+    // ...
+}
+```
+
+三者结合起来看，答案就很明晰了，stable 全程和 apply 没有关系。在 peer 层的轮询下，rowNode 会持续调用 newReady() 返回要持久化的日志，而一旦 raftLog 的日志切片中加入了新 entry，就立马返回上去，不管它有没有被 apply。因此，持久化和 apply，可以认为是两个不相干的操作。
+
 ### 2B 疑难杂症
 
 **find no region for key xxx**
