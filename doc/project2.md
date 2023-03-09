@@ -494,6 +494,96 @@ if r.electionElapsed >= r.electionTimeout{
 
 至此，Raft 模块的核心逻辑梳理完毕。
 
+#### 测试
+
+Raft 模块的测试和上层（RawNode）没有任何关系，测试代码直接新建多个 Raft 对象来模拟多节点，可以说是自己玩自己的。以 TestLeaderElection2AA 代码来说明：
+
+``` go
+func TestLeaderElection2AA(t *testing.T) {
+	var cfg func(*Config)
+	tests := []struct {
+		*network
+		state   StateType
+		expTerm uint64
+	}{
+		{newNetworkWithConfig(cfg, nil, nil, nil), StateLeader, 1},
+		{newNetworkWithConfig(cfg, nil, nil, nopStepper), StateLeader, 1},
+		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper), StateCandidate, 1},
+		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper, nil), StateCandidate, 1},
+		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper, nil, nil), StateLeader, 1},
+	}
+
+	for i, tt := range tests {
+		tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
+		sm := tt.network.peers[1].(*Raft)
+		if sm.State != tt.state {
+			t.Errorf("#%d: state = %s, want %s", i, sm.State, tt.state)
+		}
+		if g := sm.Term; g != tt.expTerm {
+			t.Errorf("#%d: term = %d, want %d", i, g, tt.expTerm)
+		}
+	}
+}
+```
+
+整体上看，测试集共有 5 组测试，每组都有一个 network，而这个 network 实际上就是多个 Raft 实例。newNetworkWithConfig 的代码如下：
+
+```go
+func newNetworkWithConfig(configFunc func(*Config), peers ...stateMachine) *network {
+	size := len(peers)
+	peerAddrs := idsBySize(size)
+
+	npeers := make(map[uint64]stateMachine, size)
+	nstorage := make(map[uint64]*MemoryStorage, size)
+
+	for j, p := range peers {
+		id := peerAddrs[j]
+		switch v := p.(type) {
+		case nil:
+			nstorage[id] = NewMemoryStorage()
+			cfg := newTestConfig(id, peerAddrs, 10, 1, nstorage[id])
+			if configFunc != nil {
+				configFunc(cfg)
+			}
+			sm := newRaft(cfg)
+			npeers[id] = sm
+		case *Raft:
+			v.id = id
+			npeers[id] = v
+		case *blackHole:
+			npeers[id] = v
+		default:
+			panic(fmt.Sprintf("unexpected state machine type: %T", p))
+		}
+	}
+	return &network{
+		peers:   npeers,
+		storage: nstorage,
+		dropm:   make(map[connem]float64),
+		ignorem: make(map[pb.MessageType]bool),
+	}
+}
+```
+
+其实，stateMachine 是一个接口，接口方法为 Step() 和 readMessage()，而这两个方法都被 Raft 实现了，因为 stateMachine 就是 Raft。上述代码就是根据传入 peer 的 type 来确定 Raft 实例的初始化信息。如果是 nil，那就是正常的节点，如果是 blackHole (nopStepper)，那可以理解为节点宕机了。随后，把这些 Raft 实例加到一个 map 中，就构成一个 network 了。
+
+tt.send() 代码如下：
+
+```go
+func (nw *network) send(msgs ...pb.Message) {
+	for len(msgs) > 0 {
+		m := msgs[0]
+		p := nw.peers[m.To]
+		p.Step(m)
+		msgs = append(msgs[1:], nw.filter(p.readMessages())...)
+	}
+}
+```
+
+其中，p.Step() 就是上述实现的 Step()。因此，测试代码就是给节点 1 发送一条 MsgHup，让其开始选举。当然这个发送也是完全模拟的，没有经过 rpc，直接通过 Step() 来找接收者得到 msg。可以看到，send() 是一个循环，只有 msg[]  中有消息，那就一直处理。当节点 1 收到 MsgHup 后，开始选举，就会发送给其他节点 msg，而这些 msg 就 append 在 msg[] 中，因此 send() 紧接着就会把它发出去。注意，send() 不是针对于某个节点，而是要处理完 network 中所有节点的所有 msg，也就是完成一轮 Raft 同步。
+
+最后，Raft 同步之后，这些节点的角色就成功了，如果目标节点的角色和预定的一致，那么测试通过。
+
 ### RawNode
 
 RawNode 作为一个信息传递的模块，主要就是上层信息的下传和下层信息的上传。其核心为一个 Ready 结构体。
@@ -554,9 +644,9 @@ RawNode 通过 HasReady() 来判断 Raft 模块是否已经有同步完成并且
 - 丢弃被压缩的暂存日志；
 - 清空 pendingSnapshot；
 
-RawNode 的核心极为上述三个方法。
+RawNode 的核心极为上述三个方法。至于 HasReady() 什么时候调用，那就是上层的事了。
 
-至此，Project2A 实现完成。
+至此，Project2A 实现完成。测试逻辑也很简单，都是自己玩自己的，这里就不说了。
 
 ### 2A 疑难杂症
 
@@ -580,7 +670,7 @@ RawNode 的核心极为上述三个方法。
 
 > Build a fault-tolerant KV server on top of Raft.
 
-project2b 实现了 rawNode 之上的上层应用，即真正开始多线程集群操作，引入了 peer 和 region 的概念。同时，除了实现上层的调用，project2b 还需要通过调用 project1 中的接口真正实现写操作。
+project2b 实现了 rawNode 之上的上层应用，即真正开始多线程集群操作，引入了 peer 和 region 的概念。同时，除了实现上层的调用，project2b 还需要通过调用 RaftStorage 中的接口真正实现写落盘。
 
 store、peer、region 三者的关系如下：
 
@@ -605,13 +695,15 @@ store、peer、region 三者的关系如下：
 该方法会将 client 的请求包装成 entry 传递给 raft 层。client 会传来一个 msg（类型为 *raft_cmdpb.RaftCmdRequest）。其中，该结构中包含了 Requests 字段和 AdminRequest 字段，即两种命令请求。在 project2B 中，暂时只用到 Requests 字段。核心分为两步：
 
 1. 通过 msg.Marshal() 将请求包装成字节流，然后通过 d.RaftGroup.Propose() 将该字节流包装成 entry 传递给下层；
-2. 为 msg 创建一个 proposal，即它的 callback 和 txn。在后续相应的 entry 执行完毕后，响应该 proposal，即 callback.Done( )；
+2. 为 msg 创建一个 proposal，即它的 index、term 以及 callback。在后续相应的 entry 执行完毕后，响应该 proposal，即 callback.Done( )；
 
 proposals 是一个 []*proposal，每一个 proposal 均有 term、index、callback。当上层想要让 peer 执行一些命令时，会发送一个 RaftCmdRequest 给该 peer，而这个 RaftCmdRequest 里有很多个 Request，需要底层执行的命令就在这些 Requset 中。这些 Request 会被封装成一个 entry 交给 peer 去在集群中同步。当 entry 被 apply 时，对应的命令就会被执行。
 
-那么问题来了，上层怎么知道底层的这些命令真的被执行并且得到命令的执行结果呢？这就是 callback 的作用。每当 peer 接收到 RaftCmdRequest 时，就会给里面的每一个 Request 一个 callback，然后封装成 proposal，其中 term 就为该 Request 对应 entry 生成时的 term 以及 index。
+那么问题来了，上层怎么知道底层的这些命令真的被执行并且得到命令的执行结果呢？这就是 callback 的作用。每当 peer 接收到 RaftCmdRequest 时，就会给里面的每一个 Request 一个 callback，然后封装成 proposal，其中 term 就为该 Request 对应 entry 生成时的 term 以及 index。当 Request 被执行后（也就是 entry 被 commit 并 apply），调用 callback.Done()。
 
 当 rawNode 返回一个 Ready 回去时，说明上述那些 entries 已经完成了同步，因此上层就可以通过 HandleRaftReady 对这些 entries 进行 apply（即执行底层读写命令）。每执行完一次 apply，都需要对 proposals 中的相应 Index 的 proposal 进行 callback 回应（调用 cb.Done()），表示这条命令已经完成了（如果是 Get 命令还会返回取到的 value），然后从中删除这个 proposal。
+
+提一嘴，proposeRaftCommand() 被封装在了 HandleMsg() 中，后者不需要我们实现，但建议去看下。
 
 #### HandleRaftReady
 
@@ -619,9 +711,13 @@ proposals 是一个 []*proposal，每一个 proposal 均有 term、index、callb
 
 1. 判断是否有新的 Ready，没有就什么都不处理；
 2. 调用 SaveReadyState 将 Ready 中需要持久化的内容保存到 badger。如果 Ready 中存在 snapshot，则应用它；
-3. 然后调用 d.Send() 方法将 Ready 中的 Msg 发送出去；
+3. 然后调用 d.Send() 方法将 Ready 中的 msg 发送出去；
 4. 应用 Ready 中的 CommittedEntries；
 5. 调用 d.RaftGroup.Advance() 推进 RawNode；
+
+其中，d.Send() 不用我们实现，但建议看一下。它会通过管道将 msg 发给对应的节点，然后节点的 **raftWorker**（raft_worker.go）通过 run() 来持续监听收到的 msg，接着调用 HandleMsg() 来处理它。至此，节点间的 msg 收发流程就闭环了。
+
+msg 的收发基本结束，接下来就是将其中可能的 entry 给存盘了。
 
 ### PeerStorage
 
@@ -634,6 +730,7 @@ raftDB 存储：
 
 kvDB 存储：
 
+- key-value
 - RaftApplyState
 - RegionLocalState
 
@@ -641,7 +738,7 @@ kvDB 存储：
 
 该方法用来持久化 Ready 中的数据。
 
-1. 通过 raft.isEmptySnap() 方法判断是否存在 Snapshot，如果有，则调用 ApplySnapshot() 方法应用；
+1. 通过 raft.isEmptySnap() 方法判断是否存在 Snapshot，如果有，则调用 ApplySnapshot() 方法应用（2C）；
 2. 调用 Append() 将需要持久化的 entries 保存到 raftDB；
 3. 保存 ready 中的 HardState 到 ps.raftState.HardState，注意先使用 raft.isEmptyHardState() 进行判空；
 4. 持久化 RaftLocalState 到 raftDB；
@@ -653,7 +750,7 @@ kvDB 存储：
 
 至此，Project2B 实现完成。
 
-但这里要明确一下，stable 和 applied 的关系，也就是持久化和应用的关系。实际上，二者是没有关系的！起初，我以为只有当 entry 被 apply 之后，它才会落盘持久化，但后来发现并不是这样。为了说清，这里直接放三段代码：
+但这里要明确一下，stable 和 applied 的关系，也就是持久化和应用的关系。在我的实现中，二者是没有关系的，或者说 stable 是更快的，一旦有 entry 进来，就需要 stable。为了说清，这里直接放三段代码：
 
 首先是 raftLog 的 appendEntry，很简单，就是把新来的 entry 加到切片中，是内存中的操作：
 
@@ -671,7 +768,7 @@ func (r *Raft) appendEntry(es []*pb.Entry){
 }
 ```
 
-接着是 newReady，看看它是怎么取出要持久化的日志的（Entries 字段）：
+接着是 newReady，看看它是怎么取出要持久化的日志的（Entries 字段），很简单：
 
 ```go
 func (rn *RawNode)newReady() Ready {
@@ -695,7 +792,9 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 }
 ```
 
-三者结合起来看，答案就很明晰了，stable 全程和 apply 没有关系。在 peer 层的轮询下，rowNode 会持续调用 newReady() 返回要持久化的日志，而一旦 raftLog 的日志切片中加入了新 entry，就立马返回上去，不管它有没有被 apply。因此，持久化和 apply，可以认为是两个不相干的操作。
+三者结合起来看，思路很明晰了，stable 全程和 apply 没有关系。在 peer 层的轮询下，rowNode 会持续调用 newReady() 返回要持久化的日志，而一旦 raftLog 的日志切片中加入了新 entry，就立马返回上去，不管它有没有被 apply。因此，持久化和 apply，我认为是两个不相干的操作。
+
+实际上，entry 更快的持久化是没有什么坏处的，相当于每当节点收到新的 entrty 就立刻让它落盘。
 
 ### 2B 疑难杂症
 
@@ -741,7 +840,7 @@ project2c 在 project2b 的基础上完成集群的快照功能。分为五个�
 
 快照接收：
 
-1. Follower 收到 Leader 发来的 pb.MessageType_MsgSnapshot 之后，会根据其中的 Metadata 来更新自己的 committed、applied、stabled 等等指针。然后将在 Snapshot 之前的 entry 均从 RaftLog.entries 中删除。之后，根据其中的 ConfState 更新自己的 Prs 信息。做完这些操作好，把 pendingSnapshot 置为该 Snapshot，等待 raftNode 通过 Ready( ) 交给 peer 层处理。
+1. Follower 收到 Leader 发来的 pb.MessageType_MsgSnapshot 之后，会根据其中的 Metadata 来更新自己的 committed、applied、stabled 等等指针。然后将在 Snapshot 之前的 entry 均从 RaftLog.entries 中删除。之后，根据其中的 ConfState 更新自己的 Prs 信息。做完这些操作后，把 pendingSnapshot 置为该 Snapshot，等待 raftNode 通过 Ready( ) 交给 peer 层处理。
 
 快照应用：
 

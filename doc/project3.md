@@ -154,7 +154,7 @@ func IsInitialMsg(msg *eraftpb.Message) bool {
 
 **执行完 enrtyConf 之后别忘了对 d.stopped 判断，然后再写入 applyState**
 
-- 首先，在 HandleRaftReady 刚开始就要进行一次 d.stopped 判断，防止宕机节点继续执行指令。但是在执行完 enrtyConf 之后，还要进行一遍 d.stopped 判断，因为其有可能通过 removeNode 把自己删了，如果不进行这个判断，就会继续执行后续的 entry，先然是错的。如果执行完 enrtyConf 之后 d.stopped == true，直接返回即可。
+- 首先，在 HandleRaftReady 刚开始就要进行一次 d.stopped 判断，防止宕机节点继续执行指令。但是在执行完 enrtyConf 之后，还要进行一遍 d.stopped 判断，因为其有可能通过 removeNode 把自己删了，如果不进行这个判断，就会继续执行后续的 entry，显然是错的。如果执行完 enrtyConf 之后 d.stopped == true，直接返回即可。
 
 **修改 RegionState 的时候不要忘了加锁**
 
