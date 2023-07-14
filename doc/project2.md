@@ -492,6 +492,47 @@ if r.electionElapsed >= r.electionTimeout{
    2. 判断 r.leadTransferee 是否为 None，如果是，则说明 Leader 转移在一个选举周期内还未完成，很有肯能是目标节点挂了，因此需要放弃转移，将其置空；
 4. 如果心跳超时，那么就重置像心跳计时，然后通过 Step() 传递一个 MsgBeat，使 Leader 向其他所有节点发送心跳；
 
+```go
+case StateLeader:
+    r.heartbeatElapsed ++
+    hbrNum := len(r.heartbeatResp)
+    total := len(r.Prs)
+    // 选举超时
+    if r.electionElapsed >= r.electionTimeout{
+        r.electionElapsed = 0
+        r.heartbeatResp = make(map[uint64] bool)
+        r.heartbeatResp[r.id] = true
+        // 心跳回应数不超过一半，说明成为孤岛，重新开始选举
+        if hbrNum*2 <= total {
+            r.startElection()
+        }
+        // leader 转移失败，目标节点可能挂了，放弃转移
+        if r.leadTransferee != None {
+            r.leadTransferee = None
+        }
+    }
+    // 心跳超时
+    if r.heartbeatElapsed >= r.heartbeatTimeout {
+        // 发送心跳
+        r.heartbeatElapsed = 0
+        err := r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+        if err != nil {
+            return
+        }
+    }
+```
+
+对于通过判断心跳数是否过半来应对网络分区，有两个问题值得思考。
+
+> 被孤立的 Leader 因为一直未收到过半心跳导致 term 持续增加？
+
+- 没错，被孤立的 Leader 的 term 会持续增加。因为判断心跳回应是否过半应该选举超时（r.electionElapsed >= r.electionTimeout）时判断，这样也就是每 r.electionTimeout 自增一次 term。
+- 对于正常的 Follower 来说，如果收到 heartbeat 那么就清空 r.electionElapsed，因此如果集群正常运转那么就不会再发生选举，从而 term 不会自增。
+
+> 被孤立的 Leader 因为 term 持续增加，那么当它回归集群时，会不会因为 term 过大直接选举成新Leader？
+
+- 不会，因此给 Candidate 投票是看**日志**的新旧，而不是节点 term 的大小，因为旧 Leader 的日志落后，因此不会被投票。
+
 至此，Raft 模块的核心逻辑梳理完毕。
 
 #### 测试
@@ -854,6 +895,28 @@ project2c 在 project2b 的基础上完成集群的快照功能。分为五个�
 2. 在 HandleMsg( ) 会中收到 message.MsgTypeTick，然后进入 onTick( ) ，触发 d.onRaftGCLogTick( ) 方法。这个方法会检查 appliedIdx - firstIdx >= d.ctx.cfg.RaftLogGcCountLimit，即未应用的 entry 数目是否大于等于你的配置。如果是，就开始进行压缩。
 3. 该方法会通过 proposeRaftCommand( ) 提交一个 AdminRequest 下去，类型为 AdminCmdType_CompactLog。然后 proposeRaftCommand( ) 就像处理其他 request 一样将该 AdminRequest 封装成 entry 交给 raft 层来同步。
 4. 当该 entry 需要被 apply 时，HandleRaftReady( ) 开始执行该条目中的命令 。这时会首先修改相关的状态，然后调用 d.ScheduleCompactLog( ) 发送 raftLogGCTask 任务给 raftlog_gc.go。raftlog_gc.go 收到后，会删除 raftDB 中对应 index 以及之前的所有已持久化的 entries，以实现压缩日志。
+
+**流程梳理**
+
+以上介绍了 snapshot 和 compact 的实现流程（前者用来保存压缩的状态，后者用来删除日志），但是并没有对整个快照流程进行梳理，这里将对快照操作的整个起始逻辑链进行梳理。
+
+首先明白一件事，一定是现有 compact 再有 snapshot！
+
+compact 的触发在上一部分已经说明了，在 d.onRaftGCLogTick( ) 中通过检查 appliedIdx - firstIdx >= d.ctx.cfg.RaftLogGcCountLimit 来决定是否进行日志删除。如果是，那么就通过 proposeRaftCommand( ) 递交一个 AdminCmdType_CompactLog 下去，当该 Request 被集群同步完成并在 HandleRaftReady 中执行时，会被交给  raftlog_gc.go 来实现删除。
+
+如果仔细看 compact 的调用链会发现，当删除完日志后，节点会更新自己的 applyState.TruncatedState.Index，该字段指已经被删除的最后一条日志，即该日志之后均没有被删除。而再看 storage.FirstIndex( ) 方法，如下：
+
+```go
+func (ps *PeerStorage) FirstIndex() (uint64, error) {
+	return ps.truncatedIndex() + 1, nil
+}
+```
+
+发现其就是返回 TruncatedState.Index + 1，也就是最小的未被删除日志。至此，compact 流程完毕，可以看到到此为止仅仅删除了日志并更改 TruncatedState，和 snapshot 还没有任何关系。
+
+接下来，当 Leader 需要 sendAppend 时，会通过比较 Follower 的 NextIndex 是否小于 entries[0] 来决定是否发送 snapshot（此时还没有生成 snapshot）。实际上，在我们实现的 maybeCompact 中，entries[0] 要被更新为 storage.FirstIndex( )，因此 sendAppend 的比较边界就是 TruncatedState.Index 。如果 Follower 的 NextIndex 小，那么就说明要快照，随后调用 r.RaftLog.storage.Snapshot( ) 来生成快照并发送，至此，snapshot 生成。
+
+总结一下，当 entry 数量超过阈值时，触发 compact，compact 删除日志并更新 TruncatedState.Index，接着当 Leader 调用 sendAppend 时才通过该 Index 决定是否生成 snapshot。
 
 ### 3C 疑难杂症
 
