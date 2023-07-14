@@ -531,7 +531,7 @@ case StateLeader:
 
 > 被孤立的 Leader 因为 term 持续增加，那么当它回归集群时，会不会因为 term 过大直接选举成新Leader？
 
-- 不会，因此给 Candidate 投票是看**日志**的新旧，而不是节点 term 的大小，因为旧 Leader 的日志落后，因此不会被投票。
+- 不会，因为给 Candidate 投票是看**日志**的新旧，而不是节点 term 的大小，旧 Leader 的日志落后，因此不会被投票。
 
 至此，Raft 模块的核心逻辑梳理完毕。
 
