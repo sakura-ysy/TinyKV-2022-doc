@@ -95,6 +95,193 @@ func (d *peerMsgHandler) notifyHeartbeatScheduler(region *metapb.Region, peer *p
 }
 ```
 
+### 节点增删的流程
+
+以上描述了 Add、Remove 需要我们写的函数的具体实现，本小节将整体性的去梳理集群增删节点的流程，从 cluster 企图增删节点开始，这一部分大多不需要我们来实现，但理解他们至关重要。
+
+从测试代码开始梳理，研究以下内容：
+
+```go
+func TestBasicConfChange3B(t *testing.T) {
+	cfg := config.NewTestConfig()
+	cluster := NewTestCluster(5, cfg)
+	cluster.Start()
+	defer cluster.Shutdown()
+
+	cluster.MustTransferLeader(1, NewPeer(1, 1))
+	cluster.MustRemovePeer(1, NewPeer(2, 2))
+	cluster.MustRemovePeer(1, NewPeer(3, 3))
+	cluster.MustRemovePeer(1, NewPeer(4, 4))
+	cluster.MustRemovePeer(1, NewPeer(5, 5))
+    // ...
+}
+```
+
+这几句的目的很显然，启动集群（初始有 5 个节点），将 Leader 转移，然后删掉四个。进入 MustRemovePeer 中查看删除操作，发现其调用 c.schedulerClient.RemovePeer，如下：
+
+```go
+func (c *Cluster) MustRemovePeer(regionID uint64, peer *metapb.Peer) {
+	c.schedulerClient.RemovePeer(regionID, peer)
+	c.MustNonePeer(regionID, peer)
+}
+```
+
+这里就引入了一个很重要的角色，schedulerClient。我们知道，从 raft 一直到 peerMsgHandler（甚至说到更上层），都是一个 peer 一个，也就是说集群有多个 peer 就有多少个。但是 Cluster 不一样，它只有一个，代表整个集群，所有的 region 共用，相应的，schedulerClient 也只有一个，负责整个集群的调度操作，其中就包括 Add、Remove 。如果写完 3C，会知道它负责的内容还会更多。
+
+那么进入 RemovePeer 去看一下，发现其操作非常简单，就是把 m.operators[regionID] 赋个值，增加就给 Add，删除就给 Remove ，转移就给 Transfer。
+
+```go
+func (m *MockSchedulerClient) RemovePeer(regionID uint64, peer *metapb.Peer) {
+	m.scheduleOperator(regionID, &Operator{
+		Type: OperatorTypeRemovePeer,
+		Data: &OpRemovePeer{
+			peer: peer,
+		},
+	})
+}
+
+func (m *MockSchedulerClient) scheduleOperator(regionID uint64, op *Operator) {
+	m.Lock()
+	defer m.Unlock()
+	m.operators[regionID] = op
+}
+```
+
+也就是说，cluster.MustRemovePeer 只是赋了个值，并不是真正下发删除指令的入口，那么入口在哪呢？很容易想到，一定有个函数会不时的询问 m.operators ，一旦有刚赋过来的操作就立刻下发指令，以此保证 MustRemovePeer 的正确性。这个询问者才是真正的入口函数，名为 RegionHeartbeat。
+
+实际上，写到 Project3C 就知道，scheduler 通过处理集群发来的心跳（注意，这个和 raft 同步的心跳不是一个东西）来时刻监控集群的状态，这一部分应该在 3C 需要我们自己完成，但是在 3B 它帮我们写好了，所以这个 scheduler 名为 MockSchedulerClient（Mock，模拟），就是为了测试 3B 而存在的 scheduler。RegionHeartbeat 就是这个 scheduler 用来监控并执行相关操作的函数。cluster 一定会不时的去调用 RegionHeartbeat 从而对集群进行操作，只不过，在哪调用我暂时没找到（尴尬）。
+
+我们看下 RegionHeartbeat 的核心部分：
+
+```go
+func (m *MockSchedulerClient) RegionHeartbeat(req *schedulerpb.RegionHeartbeatRequest) error {
+    // ...
+	if op := m.operators[regionID]; op != nil {
+		if m.tryFinished(op, req.Region, req.Leader) {
+			delete(m.operators, regionID)
+		} else {
+			m.makeRegionHeartbeatResponse(op, resp)
+		}
+		log.Debugf("[region %d] schedule %v", regionID, op)
+	}
+    
+    store := m.stores[req.Leader.GetStoreId()]
+	store.heartbeatResponseHandler(resp)
+    // ...
+}
+```
+
+其会找到 RemovePeer 赋值的 operator，然后通过 tryFinished 检查该操作是否已经完成，如果是就删除掉，留出位置给下一次操作赋值。如果否，那么就调用 makeRegionHeartbeatResponse 来取出该操作，将其包装为 resp，如下：
+
+```go
+func (m *MockSchedulerClient) makeRegionHeartbeatResponse(op *Operator, resp *schedulerpb.RegionHeartbeatResponse) {
+	switch op.Type {
+	case OperatorTypeAddPeer:
+		add := op.Data.(*OpAddPeer)
+		if !add.pending {
+			resp.ChangePeer = &schedulerpb.ChangePeer{
+				ChangeType: eraftpb.ConfChangeType_AddNode,
+				Peer:       add.peer,
+			}
+		}
+	case OperatorTypeRemovePeer:
+		remove := op.Data.(*OpRemovePeer)
+		resp.ChangePeer = &schedulerpb.ChangePeer{
+			ChangeType: eraftpb.ConfChangeType_RemoveNode,
+			Peer:       remove.peer,
+		}
+	case OperatorTypeTransferLeader:
+		transfer := op.Data.(*OpTransferLeader)
+		resp.TransferLeader = &schedulerpb.TransferLeader{
+			Peer: transfer.peer,
+		}
+	}
+}
+```
+
+看见 ConfChangeType_XXX 就熟悉起来了，就是 3B 中新加的类型。makeRegionHeartbeatResponse 完成之后，取出 region 中的 Leader，也就是代码中的 store，然后调用 heartbeatResponseHandler 执行 resp。heartbeatResponseHandler  实际是个函数指针，在集群启动时才将其赋为某个具体函数，该函数如下：
+
+```go
+func (r *SchedulerTaskHandler) onRegionHeartbeatResponse(resp *schedulerpb.RegionHeartbeatResponse) {
+	if changePeer := resp.GetChangePeer(); changePeer != nil {
+		r.sendAdminRequest(resp.RegionId, resp.RegionEpoch, resp.TargetPeer, &raft_cmdpb.AdminRequest{
+			CmdType: raft_cmdpb.AdminCmdType_ChangePeer,
+			ChangePeer: &raft_cmdpb.ChangePeerRequest{
+				ChangeType: changePeer.ChangeType,
+				Peer:       changePeer.Peer,
+			},
+		}, message.NewCallback())
+	} else if transferLeader := resp.GetTransferLeader(); transferLeader != nil {
+		r.sendAdminRequest(resp.RegionId, resp.RegionEpoch, resp.TargetPeer, &raft_cmdpb.AdminRequest{
+			CmdType: raft_cmdpb.AdminCmdType_TransferLeader,
+			TransferLeader: &raft_cmdpb.TransferLeaderRequest{
+				Peer: transferLeader.Peer,
+			},
+		}, message.NewCallback())
+	}
+}
+```
+
+欸，到这里就明晰了，最终是通过 sendAdminRequest 将 Add、Remove 封装为 AdminRequest，之后会被进一步封装为 RaftCmdRequest，然后就是通过熟悉 proposeRaftCommand 将指令下发给 Leader 了。
+
+至此，Add、Remove 的下发流程就梳理完毕了，也就是仍然通过 entry -> HandleRaftReady 的方式来执行，既然如此，那必然需要同步（Transfer 除外，它是唯一一个不需要同步的指令），即所有节点都要执行。接下来就梳理一下执行流程。
+
+我们先以 Remove 为例，假设集群（单 region）有 5 个节点 A B C D E。当上层想要删除节点 E 时，会下发一个 RaftCmdRequest 给集群来同步，在 entry 完成同步之前，集群中仍然是这个 5 个节点，没少。接下来，5 个节点同步完成，相继通过 handleRaftReady 来执行 Remove。对于节点 A B C D 而言，它们会从下到上更改自己认知的 peers 信息，包括 3A 中写的 raft 层、更上层的 Region() 信息、GlobalContext 的 storeMeta 等等，细节涉及代码实现，不赘述了。而对于节点 E 而言，当发现要删的节点就是自己时，它就会调用 destroyPeer 来销毁自己。至此，节点 E 脱离集群，同时其余节点认知中也不再存在 E，Remove 执行完毕。
+
+接下来看 Add。首先看上层下发时传入的参数：
+
+```go
+cluster.MustAddPeer(1, NewPeer(2, 2))
+```
+
+NewPeer，仅仅有 sotreId 和 peerID。也就是说，Add 只是新增空节点，而不是恢复之前 Remove 的节点，二者没有直接联系。不妨称新的节点为 F，和 Remove 一样，Add 请求被封装为 entry 在 A B C D 中同步，然后在 handleRaftReady 中解封装为 RaftCmdRequest 执行。直到此刻，集群啊还是 A B C D，没有 F。梳理 Add 流程的关键在于，F 何时会出现。
+
+和 Remove 类似，A B C D 会从下至上更改自己认知的 peers 信息，也即，它们认为有 F 了。但不同于 Remove 在 handleRaftReady 完成之后也就完成了，Add 在 handleRaftReady 之后还有一段路要走，因为此时只是现有节点**认为**有个新节点为 F，但实际上，F 根本就没有创建。
+
+接下来探讨 F 何时创建，我们将视角转到 Leader（假设为 A） 。此时，A 的 peers 中有 F，那么它就会给 F 发送心跳 Msg。重点来了，每一个要发送的 Msg 会先经过一个名为 onRaftMessage 的函数，该函数的主要作用是检查。要检查的内容很多， 其中一项就是检查 Msg.To 是否存在。各种检查之后，会调用 maybeCreatePeer 函数，该函数才是真正创造 F 的入口。
+
+```go
+func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
+	// ... 各种检查
+	created, err := d.maybeCreatePeer(regionID, msg)
+    // ...
+}
+```
+
+如何走到这一步，代码有点冗长，直接说结论，当 Msg 为心跳、Msg.Commit == util.RaftInvalidIndex 且 Msg.To 不存在，三个条件满足就会走到这一步。很明显，A 发送给 F 的心跳 Msg，满足它们。
+
+接下来看 maybeCreatePeer，直接看最核心的部分：
+
+```go
+func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (bool, error) {
+    // ...
+	peer, err := replicatePeer(
+		d.ctx.store.Id, d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, regionID, msg.ToPeer)
+	if err != nil {
+		return false, err
+	}
+	// following snapshot may overlap, should insert into regionRanges after
+	// snapshot is applied.
+	meta.regions[regionID] = peer.Region()
+	d.ctx.router.register(peer)
+	_ = d.ctx.router.send(regionID, message.Msg{Type: message.MsgTypeStart})
+	return true, nil
+    // ...
+}
+```
+
+上述代码才是真正创建 F 并将其注册进集群的，此时，集群才成为 A B C D F。
+
+Add 操作到此位置，F 加入完毕。但还有一个重要问题没有解决，那就是 F 的信息同步问题了。F 刚加进来，什么都不知道，就连 Region() 都是空的（这点可以看 replicatePeer），也就是说 F 所认知的 region 信息和其余四个相比完全落后。因此，我们要更改 F 对 region 的认知，使它和其余四个一致，或者说，和 Leader 一致。这个问题的答案，TinyKV 文档会给我们提示：
+
+> The leader then will know this Follower has no data (there exists a Log gap from 0 to 5) and it will directly send a snapshot to this Follower
+
+也即，A 即刻会发现 F 日志落后了，随机给它发送 snapshot。当 F 收到 snapshot 之后，会递交给 handleRaftReady 中应用，而 F.Region() 的更新，就是在 snapshot 的应用中完成的。F 的 handleRaftReady 收到 snapshot 之后，会调用 SaveReadyState 来应用，而 SaveReadyState 实际是调用 ApplySnapshot 来应用，这是 2C 的内容，大家都知道。
+
+SaveReadyState 执行完毕后会返回 applySnapRet。F 就是通过 applySnapRet 来更新自己的 region 信息以及 GlobalContext.storeMeta 的 。所以重点就在于，ApplySnapshot 是如何生成 applySnapRet 的，这是大家要对 2C 代码部分进行的更改。
+
+至此，F 的 region 信息同步完毕，集群正式更新为 A B C D F。
+
 ### Split
 
 3B 要实现 Split，即将一个 region 一分为二，降低单个 region 的存储压力。当 regionA 容量超出 Split 阀值时触发 Split 操作，按照 Split Key 将 regionA 按照 Key 的字典序一分为二，成为 regionA 和 regionB，从此 regionA 、regionB 为两个独立的 region。
