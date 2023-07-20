@@ -6,6 +6,7 @@
   - [Project3B](#project3b)
     - [LeaderTransfer](#leadertransfer-1)
     - [Add / Remove](#add--remove-1)
+    - [节点增删的流程](#节点增删的流程)
     - [Split](#split)
       - [Split 触发](#split-触发)
       - [Split 应用](#split-应用)
